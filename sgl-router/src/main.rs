@@ -1,7 +1,7 @@
 use clap::{ArgAction, Parser};
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    MetricsConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    MetricsConfig, PolicyConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -266,6 +266,22 @@ struct CliArgs {
     /// Health check endpoint path
     #[arg(long, default_value = "/health")]
     health_check_endpoint: String,
+
+    /// Whether or not to use Redis for routing
+    #[arg(long, default_value_t = false)]
+    redis_routing: bool,
+
+    /// If using Redis for routing, host of the server
+    #[arg(long, default_value = "127.0.0.1")]
+    redis_host: String,
+
+    /// If using Redis for routing, port of the server
+    #[arg(long, default_value_t = 6379)]
+    redis_port: u16,
+
+    /// If using Redis for routing, base name of the experiment
+    #[arg(long, default_value = "default")]
+    experiment_name: String,
 }
 
 impl CliArgs {
@@ -361,6 +377,12 @@ impl CliArgs {
             host: self.prometheus_host.clone(),
         });
 
+        let redis_config = self.redis_routing.then(|| RedisConfig {
+            host: self.redis_host.clone(),
+            port: self.redis_port,
+            experiment_name: self.experiment_name.clone(),
+        });
+
         // Build RouterConfig
         Ok(RouterConfig {
             mode,
@@ -406,6 +428,7 @@ impl CliArgs {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            redis_config,
         })
     }
 
@@ -453,7 +476,8 @@ impl CliArgs {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse prefill arguments manually before clap parsing
     let prefill_urls = parse_prefill_args();
 
@@ -510,10 +534,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_config = cli_args.to_server_config(router_config);
 
     // Create a new runtime for the server (like Python binding does)
-    let runtime = tokio::runtime::Runtime::new()?;
+    let mut tasks = tokio::task::JoinSet::new();
 
-    // Block on the async startup function
-    runtime.block_on(async move { server::startup(server_config).await })?;
+    let redis_server_config = server_config.clone();
+    tasks.spawn(async move { server::startup(server_config).await });
+    tasks.spawn(async move { server::start_redis(redis_server_config).await });
+
+    while let Some(task) = tasks.join_next().await {
+        let _ = task?;
+    }
 
     Ok(())
 }

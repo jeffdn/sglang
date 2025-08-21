@@ -189,6 +189,7 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
             },
+            redis_config: None,
         })
     }
 }

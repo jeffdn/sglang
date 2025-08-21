@@ -2,7 +2,7 @@ use crate::config::RouterConfig;
 use crate::logging::{self, LoggingConfig};
 use crate::metrics::{self, PrometheusConfig};
 use crate::protocols::{
-    generate::GenerateRequest,
+    generate::{GenerateRequest, RawInferenceRequest},
     openai::{chat::ChatCompletionRequest, completions::CompletionRequest},
 };
 use crate::routers::{RouterFactory, RouterTrait};
@@ -14,6 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use redis::AsyncCommands;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,6 +166,7 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
     state.router.get_worker_loads().await
 }
 
+#[derive(Clone)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -229,7 +231,37 @@ pub fn build_app(
         .with_state(app_state)
 }
 
-pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn build_app_state(
+    config: &ServerConfig,
+) -> Result<Arc<AppState>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = Client::builder()
+        .pool_idle_timeout(Some(Duration::from_secs(50)))
+        .pool_max_idle_per_host(500) // Increase to 500 connections per host
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .connect_timeout(Duration::from_secs(10)) // Separate connection timeout
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30))) // Keep connections alive
+        .build()
+        .expect("Failed to create HTTP client");
+
+    // Create the application context with all dependencies
+    let app_context = Arc::new(AppContext::new(
+        config.router_config.clone(),
+        client.clone(),
+        config.router_config.max_concurrent_requests,
+    ));
+
+    // Create router with the context
+    let router = RouterFactory::create_router(&app_context).await?;
+
+    // Create app state with router and context
+    Ok(Arc::new(AppState {
+        router: Arc::from(router),
+        context: app_context.clone(),
+    }))
+}
+
+pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Only initialize logging if not already done (for Python bindings support)
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -257,8 +289,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     // Initialize prometheus metrics exporter
-    if let Some(prometheus_config) = config.prometheus_config {
-        metrics::start_prometheus(prometheus_config);
+    if let Some(prometheus_config) = &config.prometheus_config {
+        metrics::start_prometheus(prometheus_config.clone());
     }
 
     info!(
@@ -270,31 +302,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .pool_max_idle_per_host(500) // Increase to 500 connections per host
-        .timeout(Duration::from_secs(config.request_timeout_secs))
-        .connect_timeout(Duration::from_secs(10)) // Separate connection timeout
-        .tcp_nodelay(true)
-        .tcp_keepalive(Some(Duration::from_secs(30))) // Keep connections alive
-        .build()
-        .expect("Failed to create HTTP client");
-
-    // Create the application context with all dependencies
-    let app_context = Arc::new(AppContext::new(
-        config.router_config.clone(),
-        client.clone(),
-        config.router_config.max_concurrent_requests,
-    ));
-
-    // Create router with the context
-    let router = RouterFactory::create_router(&app_context).await?;
-
-    // Create app state with router and context
-    let app_state = Arc::new(AppState {
-        router: Arc::from(router),
-        context: app_context.clone(),
-    });
+    let app_state = build_app_state(&config).await?;
     let router_arc = Arc::clone(&app_state.router);
 
     // Start the service discovery if enabled
@@ -352,9 +360,81 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
     Ok(())
+}
+
+async fn _handle_raw_inference_request(
+    req: RawInferenceRequest,
+    router: Arc<dyn RouterTrait>,
+    mut conn: redis::aio::MultiplexedConnection,
+    out_queue: &str,
+) {
+    let server_req: GenerateRequest = req.into();
+    let res = router.route_generate(None, &server_req).await;
+
+    if res.status() != StatusCode::OK {
+        warn!("uh oh");
+        return;
+    }
+
+    let raw_body = res.into_body();
+    let body_bytes = match axum::body::to_bytes(raw_body, usize::MAX).await {
+        Ok(bb) => bb,
+        Err(e) => { warn!("uh oh: {}", e); return; },
+    };
+    let body_str: Vec<u8> = body_bytes.into();
+    let pub_res: redis::RedisResult<()> = conn.publish(out_queue, body_str).await;
+    match pub_res {
+        Ok(_) => {},
+        Err(e) => { warn!("uh oh: {}", e); },
+    };
+}
+
+pub async fn start_redis(config: ServerConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(redis_config) = &config.router_config.redis_config else {
+        return Ok(());
+    };
+
+    let app_state = build_app_state(&config).await?;
+    let router = app_state.router.clone();
+
+    let client = redis::Client::open(format!(
+        "redis://{}:{}/",
+        redis_config.host, redis_config.port
+    ))?;
+    // let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // let config = redis::AsyncConnectionConfig::new().set_push_sender(tx);
+    // let mut con = client.get_multiplexed_async_connection_with_config(&config).await?;
+    // con.subscribe(&["channel_1", "channel_2"]).await?;
+
+    let mut conn = client.get_multiplexed_async_connection().await?;
+
+    loop {
+        let raw_result: String = match conn.zpopmin("input", 1).await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("error in waiting for the next batch: {}", e);
+                continue;
+                // return Err(Box::new(e) as Box<dyn std::error::Error>)
+            }
+        };
+
+        let result: RawInferenceRequest = match serde_json::from_str(&raw_result) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("unable to deserialize batch: {}", e);
+                continue;
+            }
+        };
+
+        let new_conn = conn.clone();
+        let new_router = router.clone();
+        tokio::spawn(async move {
+            _handle_raw_inference_request(result, new_router, new_conn, "output").await
+        });
+    }
 }
 
 // Graceful shutdown handler

@@ -95,3 +95,112 @@ impl GenerationRequest for GenerateRequest {
         String::new()
     }
 }
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PromptOrTokens {
+    #[serde(rename = "prompts")]
+    Prompts(Vec<String>),
+    #[serde(rename = "prompt_tokens")]
+    PromptTokens(Vec<HashMap<String, String>>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TopKOrTopP {
+    #[serde(rename = "top_k")]
+    TopK(u32),
+    #[serde(rename = "top_p")]
+    TopP(f32),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TimeoutOrExpiry {
+    #[serde(rename = "timeout_sec")]
+    TimeoutSec(f32),
+    #[serde(rename = "expiry_ts")]
+    ExpiryTs(f32),
+}
+
+fn default_tokens_to_generate() -> u32 {
+    64
+}
+
+fn default_temperature() -> f32 {
+    1.0
+}
+
+fn default_stop() -> Vec<String> {
+    vec![]
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+pub struct RawInferenceRequest {
+    #[serde(flatten)]
+    prompt_or_tokens: PromptOrTokens,
+    #[serde(flatten)]
+    top_k_or_top_p: TopKOrTopP,
+    #[serde(flatten)]
+    timeout_or_expiry: TimeoutOrExpiry,
+    #[serde(default = "default_tokens_to_generate")]
+    tokens_to_generate: u32,
+    #[serde(default)]
+    logprobs: bool,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_stop")]
+    stop: Vec<String>,
+    prompt_prefix: Option<String>,
+    trim_start_str: Option<String>,
+    random_seed: Option<u64>,
+    fields: Option<Vec<String>>,
+    stream_nth_token: Option<u32>,
+    batch_ts: Option<f32>,
+}
+
+impl From<RawInferenceRequest> for GenerateRequest {
+    fn from(value: RawInferenceRequest) -> Self {
+        let (prompt, tokens): (Option<String>, Option<InputIds>) = match value.prompt_or_tokens {
+            PromptOrTokens::Prompts(prompts) => (Some(prompts[0].clone()), None),
+            PromptOrTokens::PromptTokens(_) => unreachable!(),
+        };
+        let (top_k, top_p): (Option<u32>, Option<f32>) = match value.top_k_or_top_p {
+            TopKOrTopP::TopK(top_k) => (Some(top_k), None),
+            TopKOrTopP::TopP(top_p) => (None, Some(top_p)),
+        };
+
+        Self {
+            prompt: None,
+            text: prompt,
+            input_ids: tokens,
+            parameters: Some(GenerateParameters {
+                best_of: None,
+                decoder_input_details: None,
+                details: None,
+                do_sample: None,
+                max_new_tokens: Some(value.tokens_to_generate),
+                seed: value.random_seed,
+                repetition_penalty: None,
+                stop: Some(value.stop),
+                temperature: Some(value.temperature),
+                top_k,
+                top_p,
+                return_full_text: None,
+                truncate: None,
+                typical_p: None,
+                watermark: None,
+            }),
+            sampling_params: None,
+            stream: false,
+            return_logprob: true,
+            lora_path: None,
+            session_params: None,
+            return_hidden_states: false,
+            rid: None,
+        }
+    }
+}

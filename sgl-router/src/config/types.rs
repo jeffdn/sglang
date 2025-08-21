@@ -51,6 +51,8 @@ pub struct RouterConfig {
     pub disable_circuit_breaker: bool,
     /// Health check configuration
     pub health_check: HealthCheckConfig,
+    /// Redis configuration
+    pub redis_config: Option<RedisConfig>,
 }
 
 /// Routing mode configuration
@@ -254,6 +256,27 @@ impl Default for HealthCheckConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    /// Redis host location
+    pub host: String,
+    /// Port Redis is running on
+    pub port: u16,
+    /// Experiment name, on which to base queue names
+    pub experiment_name: String,
+}
+
+/// Retry configuration for request handling
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 6379,
+            experiment_name: "default".into(),
+        }
+    }
+}
+
 /// Circuit breaker configuration for worker reliability
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitBreakerConfig {
@@ -323,6 +346,7 @@ impl Default for RouterConfig {
             disable_retries: false,
             disable_circuit_breaker: false,
             health_check: HealthCheckConfig::default(),
+            redis_config: None,
         }
     }
 }
